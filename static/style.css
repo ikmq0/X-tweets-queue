@@ -430,6 +430,16 @@ input:focus, textarea:focus {
     justify-content: center;
 }
 
+.time-window-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--bg-color);
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+}
+
 /* --- Toast Notifications --- */
 
 #toast-container {

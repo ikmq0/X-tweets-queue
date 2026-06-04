@@ -4,27 +4,25 @@ import uuid
 import asyncio
 import random
 import tempfile
-from typing import Optional, List
+from typing import List
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status, Response
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from dotenv import load_dotenv
+import dotenv
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
+import bcrypt
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 load_dotenv()
 
 # Scheduling Constants
 RIYADH_TZ = ZoneInfo("Asia/Riyadh")
-WINDOWS = [
-    (7, 30),   # Morning Coffee
-    (12, 0),   # Midday Break
-    (17, 15),  # Afternoon Commute
-    (21, 0)    # Evening Reading
-]
 
 SESSION_TTL_MINUTES = 30
 MAX_RETRY_COUNT = 3
@@ -38,16 +36,30 @@ os.makedirs("templates", exist_ok=True)
 QUEUE_FILE = "data/queue.json"
 SESSION_FILE = "data/sessions.json"
 BOT_STATUS_FILE = "data/bot_status.json"
+SETTINGS_FILE = "data/settings.json"
 
-# App Credentials
+# App Credentials & Security
+env_path = ".env"
+
+# Auto-migrate plaintext password to hash if present
+plaintext_pwd = os.getenv("ADMIN_PASSWORD")
+if plaintext_pwd:
+    salt = bcrypt.gensalt()
+    hash_pwd = bcrypt.hashpw(plaintext_pwd.encode('utf-8'), salt).decode('utf-8')
+    dotenv.set_key(env_path, "ADMIN_PASSWORD_HASH", hash_pwd)
+    dotenv.unset_key(env_path, "ADMIN_PASSWORD")
+    os.environ["ADMIN_PASSWORD_HASH"] = hash_pwd
+    if "ADMIN_PASSWORD" in os.environ:
+        del os.environ["ADMIN_PASSWORD"]
+
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "adminpass")
 
 # File locks to prevent race conditions between the worker and API
 _queue_lock = asyncio.Lock()
 _session_lock = asyncio.Lock()
 _status_lock = asyncio.Lock()
-_queue_wakeup = asyncio.Event()
+_settings_lock = asyncio.Lock()
 
 # --- Pydantic Models ---
 
@@ -57,6 +69,9 @@ class TweetRequest(BaseModel):
 
 class EditTweetRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=280)
+
+class SettingsRequest(BaseModel):
+    windows: List[List[int]]
 
 # --- File I/O Helpers (atomic writes) ---
 
@@ -140,6 +155,13 @@ async def require_auth(request: Request):
 
 # --- Scheduling Algorithm ---
 
+def get_windows():
+    settings = _load_json_sync(SETTINGS_FILE, {"windows": [[7, 30], [12, 0], [17, 15], [21, 0]]})
+    windows = settings.get("windows", [[7, 30], [12, 0], [17, 15], [21, 0]])
+    if not windows:
+        windows = [[12, 0]] # Fallback if empty
+    return windows
+
 def get_next_available_slot(queue_data):
     now = datetime.now(RIYADH_TZ)
 
@@ -152,9 +174,10 @@ def get_next_available_slot(queue_data):
         base_dt = now
 
     current_date = base_dt.date()
+    windows = get_windows()
 
     # Try today's windows
-    for hour, minute in WINDOWS:
+    for hour, minute in windows:
         window_dt = datetime(current_date.year, current_date.month, current_date.day, hour, minute, tzinfo=RIYADH_TZ)
         if window_dt > base_dt:
             jitter_minutes = random.randint(1, 20)
@@ -163,7 +186,7 @@ def get_next_available_slot(queue_data):
 
     # All today's windows are past — roll to tomorrow's first window
     next_date = current_date + timedelta(days=1)
-    hour, minute = WINDOWS[0]
+    hour, minute = windows[0]
     window_dt = datetime(next_date.year, next_date.month, next_date.day, hour, minute, tzinfo=RIYADH_TZ)
     jitter_minutes = random.randint(1, 20)
     jitter_seconds = random.randint(0, 59)
@@ -243,89 +266,110 @@ async def post_tweet(content: str):
 
 # --- Background Worker ---
 
-async def process_queue_worker():
-    while True:
-        try:
-            queue_data = await load_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock)
+async def process_queue_tick():
+    try:
+        queue_data = await load_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock)
 
-            # Find items that are ready to post (scheduled_at <= now)
-            ready_items = [item for item in queue_data.get("queued", []) if datetime.now(RIYADH_TZ) >= datetime.fromisoformat(item["scheduled_at"])]
+        # Find items that are ready to post (scheduled_at <= now)
+        ready_items = [item for item in queue_data.get("queued", []) if datetime.now(RIYADH_TZ) >= datetime.fromisoformat(item["scheduled_at"])]
 
-            for item_to_post in ready_items:
-                print(f"Time to post! Attempting item: {item_to_post['id']} (attempt {item_to_post.get('retry_count', 0) + 1})")
-                
-                status, message = await post_tweet(item_to_post["content"])
+        for item_to_post in ready_items:
+            print(f"Time to post! Attempting item: {item_to_post['id']} (attempt {item_to_post.get('retry_count', 0) + 1})")
+            
+            status, message = await post_tweet(item_to_post["content"])
 
-                if status == "SUCCESS":
-                    def move_to_posted(data):
-                        data["queued"] = [x for x in data["queued"] if x["id"] != item_to_post["id"]]
-                        item_to_post["posted_at"] = datetime.now(RIYADH_TZ).isoformat()
-                        item_to_post["last_error"] = None
-                        if "posted" not in data:
-                            data["posted"] = []
-                        data["posted"].append(item_to_post)
-                    await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, move_to_posted)
-                elif status == "TWEET_ERROR":
-                    def handle_tweet_failure(data):
-                        target = next((x for x in data["queued"] if x["id"] == item_to_post["id"]), None)
-                        if target:
-                            target["retry_count"] = target.get("retry_count", 0) + 1
-                            target["last_error"] = message
-                            if target["retry_count"] >= 3:
-                                data["queued"].remove(target)
-                                target["failed_at"] = datetime.now(RIYADH_TZ).isoformat()
-                                if "failed" not in data:
-                                    data["failed"] = []
-                                data["failed"].append(target)
-                    await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, handle_tweet_failure)
-                elif status == "SYSTEM_ERROR":
-                    print(f"System Error encountered: {message}")
-                    # Update bot status UI globally
-                    status_data = {
-                        "status": "Error",
-                        "last_checked": datetime.now(RIYADH_TZ).isoformat(),
-                        "last_message": message
-                    }
-                    # Keep x_username if it exists in current status
-                    try:
-                        with open(BOT_STATUS_FILE, "r") as f:
-                            old_status = json.load(f)
-                        if old_status.get("x_username"):
-                            status_data["x_username"] = old_status["x_username"]
-                    except Exception:
-                        pass
-                        
-                    await save_json(BOT_STATUS_FILE, status_data, _status_lock)
-                    
-                    # Shift in queue without consuming retry
-                    def shift_system_error(data):
-                        target = next((x for x in data["queued"] if x["id"] == item_to_post["id"]), None)
-                        if target:
+            if status == "SUCCESS":
+                def move_to_posted(data):
+                    data["queued"] = [x for x in data["queued"] if x["id"] != item_to_post["id"]]
+                    item_to_post["posted_at"] = datetime.now(RIYADH_TZ).isoformat()
+                    item_to_post["last_error"] = None
+                    if "posted" not in data:
+                        data["posted"] = []
+                    data["posted"].append(item_to_post)
+                await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, move_to_posted)
+            elif status == "TWEET_ERROR":
+                def handle_tweet_failure(data):
+                    target = next((x for x in data["queued"] if x["id"] == item_to_post["id"]), None)
+                    if target:
+                        target["retry_count"] = target.get("retry_count", 0) + 1
+                        target["last_error"] = message
+                        if target["retry_count"] >= 3:
                             data["queued"].remove(target)
-                            target["scheduled_at"] = get_next_available_slot(data).isoformat()
-                            target["last_error"] = f"System Error: {message}"
-                            data["queued"].append(target)
-                            data["queued"] = sorted(data["queued"], key=lambda x: x["scheduled_at"])
-                    await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, shift_system_error)
+                            target["failed_at"] = datetime.now(RIYADH_TZ).isoformat()
+                            if "failed" not in data:
+                                data["failed"] = []
+                            data["failed"].append(target)
+                await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, handle_tweet_failure)
+            elif status == "SYSTEM_ERROR":
+                print(f"System Error encountered: {message}")
+                # Update bot status UI globally
+                status_data = {
+                    "status": "Error",
+                    "last_checked": datetime.now(RIYADH_TZ).isoformat(),
+                    "last_message": message
+                }
+                # Keep x_username if it exists in current status
+                try:
+                    with open(BOT_STATUS_FILE, "r") as f:
+                        old_status = json.load(f)
+                    if old_status.get("x_username"):
+                        status_data["x_username"] = old_status["x_username"]
+                except Exception:
+                    pass
+                    
+                await save_json(BOT_STATUS_FILE, status_data, _status_lock)
+                
+                # Shift in queue without consuming retry
+                def shift_system_error(data):
+                    target = next((x for x in data["queued"] if x["id"] == item_to_post["id"]), None)
+                    if target:
+                        data["queued"].remove(target)
+                        target["scheduled_at"] = get_next_available_slot(data).isoformat()
+                        target["last_error"] = f"System Error: {message}"
+                        data["queued"].append(target)
+                        data["queued"] = sorted(data["queued"], key=lambda x: x["scheduled_at"])
+                await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, shift_system_error)
 
-        except Exception as e:
-            print(f"Error in queue worker: {e}")
-
-        try:
-            await asyncio.wait_for(_queue_wakeup.wait(), timeout=60)
-            _queue_wakeup.clear()
-        except asyncio.TimeoutError:
-            pass
+    except Exception as e:
+        print(f"Error in queue tick: {e}")
 
 # --- App Lifespan ---
 
 @asynccontextmanager
 async def lifespan(app):
-    worker_task = asyncio.create_task(process_queue_worker())
-    yield
-    worker_task.cancel()
+    # Startup: Shift missed tweets to the future
+    async def shift_missed_tweets():
+        def shift_logic(data):
+            now = datetime.now(RIYADH_TZ)
+            changed = False
+            for item in data.get("queued", []):
+                item_dt = datetime.fromisoformat(item["scheduled_at"])
+                # If missed by more than 10 minutes, shift it to next available slot
+                if item_dt < now - timedelta(minutes=10):
+                    print(f"Shifting missed tweet {item['id']} to future window.")
+                    # Temporarily remove it so get_next_available_slot doesn't base off of it
+                    data["queued"].remove(item)
+                    item["scheduled_at"] = get_next_available_slot(data).isoformat()
+                    data["queued"].append(item)
+                    changed = True
+            if changed:
+                data["queued"] = sorted(data["queued"], key=lambda x: x["scheduled_at"])
+        await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, shift_logic)
+        
+    await shift_missed_tweets()
 
-app = FastAPI(title="X Scheduled Posting", lifespan=lifespan)
+    # Start APScheduler
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(process_queue_tick, trigger=IntervalTrigger(seconds=60))
+    scheduler.start()
+    print("APScheduler started.")
+    
+    yield
+    
+    scheduler.shutdown()
+    print("APScheduler shutdown.")
+
+app = FastAPI(title="X Tweets Queue", lifespan=lifespan)
 
 # Mount static files and templates
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -340,7 +384,14 @@ async def read_root(request: Request):
 
 @app.post("/login")
 async def login(request: Request, response: Response, username: str = Form(...), password: str = Form(...)):
-    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+    is_valid_pwd = False
+    if ADMIN_PASSWORD_HASH:
+        try:
+            is_valid_pwd = bcrypt.checkpw(password.encode('utf-8'), ADMIN_PASSWORD_HASH.encode('utf-8'))
+        except Exception:
+            pass
+            
+    if username == ADMIN_USERNAME and is_valid_pwd:
         session_id = str(uuid.uuid4())
 
         def add_session(data):
@@ -397,7 +448,6 @@ async def add_tweet(tweet: TweetRequest, user: str = Depends(require_auth)):
         result = new_item
 
     await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, add_item)
-    _queue_wakeup.set()
     return {"message": "Tweet added", "item": result}
 
 @app.put("/api/queue/{item_id}")
@@ -550,6 +600,33 @@ async def verify_bot(user: str = Depends(require_auth)):
 
     await save_json(BOT_STATUS_FILE, status_data, _status_lock)
     return status_data
+
+# --- Settings ---
+
+@app.get("/api/settings")
+async def api_get_settings(user: str = Depends(require_auth)):
+    return {"windows": get_windows()}
+
+@app.put("/api/settings")
+async def api_update_settings(settings: SettingsRequest, user: str = Depends(require_auth)):
+    windows = sorted(settings.windows, key=lambda x: (x[0], x[1]))
+    def update_s(data):
+        data["windows"] = windows
+    await load_and_save_json(SETTINGS_FILE, {"windows": []}, _settings_lock, update_s)
+    
+    # Recalculate queued tweets
+    def update_queue(data):
+        # Only recompute if we actually have items, to distribute them according to new schedule
+        if data.get("queued"):
+            old_queued = sorted(data.get("queued", []), key=lambda x: x["scheduled_at"])
+            data["queued"] = []
+            for item in old_queued:
+                item["scheduled_at"] = get_next_available_slot(data).isoformat()
+                data["queued"].append(item)
+    
+    await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, update_queue)
+    
+    return {"message": "Settings updated and queue rescheduled", "windows": windows}
 
 if __name__ == "__main__":
     import uvicorn

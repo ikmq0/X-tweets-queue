@@ -26,6 +26,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const editContent = document.getElementById('edit-content');
     const closeModal = document.getElementById('close-modal');
 
+    // Settings Modal
+    const settingsModal = document.getElementById('settings-modal');
+    const openSettingsBtn = document.getElementById('open-settings-btn');
+    const closeSettingsModalBtn = document.getElementById('close-settings-modal');
+    const windowsList = document.getElementById('windows-list');
+    const addWindowForm = document.getElementById('add-window-form');
+    const newWindowTime = document.getElementById('new-window-time');
+    const saveSettingsBtn = document.getElementById('save-settings-btn');
+    let currentWindows = [];
+
+    // Help Modal
+    const helpModal = document.getElementById('help-modal');
+    const openHelpBtn = document.getElementById('open-help-btn');
+    const closeHelpModalBtn = document.getElementById('close-help-modal');
+
     // Confirm Modal
     const confirmModal = document.getElementById('confirm-modal');
     const confirmMessage = document.getElementById('confirm-message');
@@ -505,8 +520,141 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // ==================== Settings Modal ====================
+    
+    const loadSettings = async () => {
+        try {
+            const response = await apiFetch('/api/settings');
+            if (response && response.ok) {
+                const data = await response.json();
+                currentWindows = data.windows || [];
+                renderWindows();
+            }
+        } catch (error) {
+            console.error('Failed to load settings', error);
+        }
+    };
+
+    const renderWindows = () => {
+        windowsList.innerHTML = '';
+        if (currentWindows.length === 0) {
+            windowsList.innerHTML = '<p class="text-sm text-secondary text-center py-2">No posting windows configured.</p>';
+            return;
+        }
+
+        // Sort just for display
+        const sorted = [...currentWindows].sort((a, b) => {
+            if (a[0] !== b[0]) return a[0] - b[0];
+            return a[1] - b[1];
+        });
+
+        sorted.forEach((win, index) => {
+            const h = win[0].toString().padStart(2, '0');
+            const m = win[1].toString().padStart(2, '0');
+            const timeStr = `${h}:${m}`;
+            
+            const div = document.createElement('div');
+            div.className = 'time-window-item';
+            
+            const span = document.createElement('span');
+            span.textContent = timeStr;
+            
+            const btn = document.createElement('button');
+            btn.className = 'btn-icon btn-delete';
+            btn.textContent = 'Remove';
+            btn.type = 'button';
+            btn.onclick = () => {
+                currentWindows.splice(index, 1);
+                renderWindows();
+            };
+            
+            div.appendChild(span);
+            div.appendChild(btn);
+            windowsList.appendChild(div);
+        });
+    };
+
+    if (openSettingsBtn) {
+        openSettingsBtn.addEventListener('click', () => {
+            loadSettings(); // Reload fresh every time opened
+            settingsModal.classList.add('active');
+        });
+    }
+
+    if (closeSettingsModalBtn) {
+        closeSettingsModalBtn.addEventListener('click', () => {
+            settingsModal.classList.remove('active');
+        });
+    }
+
+    if (addWindowForm) {
+        addWindowForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const timeVal = newWindowTime.value; // "HH:MM"
+            if (!timeVal) return;
+            
+            const [h, m] = timeVal.split(':').map(Number);
+            // Check for duplicates
+            const exists = currentWindows.some(w => w[0] === h && w[1] === m);
+            if (exists) {
+                showToast('This time window already exists.', 'warning');
+                return;
+            }
+            
+            currentWindows.push([h, m]);
+            renderWindows();
+            newWindowTime.value = '';
+        });
+    }
+
+    if (saveSettingsBtn) {
+        saveSettingsBtn.addEventListener('click', async () => {
+            if (currentWindows.length === 0) {
+                showToast('You must have at least one posting window.', 'error');
+                return;
+            }
+            saveSettingsBtn.disabled = true;
+            saveSettingsBtn.textContent = 'Saving...';
+            try {
+                const response = await apiFetch('/api/settings', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ windows: currentWindows })
+                });
+
+                if (response && response.ok) {
+                    settingsModal.classList.remove('active');
+                    showToast('Settings saved. Queued tweets have been rescheduled!', 'success');
+                    loadQueue(); // Refresh queue view to see new schedules
+                } else if (response) {
+                    const err = await response.json();
+                    showToast(err.detail || 'Failed to save settings.', 'error');
+                }
+            } catch (error) {
+                showToast('Network error. Could not save settings.', 'error');
+            } finally {
+                saveSettingsBtn.disabled = false;
+                saveSettingsBtn.textContent = 'Save Settings';
+            }
+        });
+    }
+
+    // ==================== Help Modal ====================
+    if (openHelpBtn) {
+        openHelpBtn.addEventListener('click', () => {
+            helpModal.classList.add('active');
+        });
+    }
+
+    if (closeHelpModalBtn) {
+        closeHelpModalBtn.addEventListener('click', () => {
+            helpModal.classList.remove('active');
+        });
+    }
+
     // Close modals on backdrop click
-    [editModal, confirmModal].forEach(modal => {
+    [editModal, confirmModal, settingsModal, helpModal].forEach(modal => {
+        if (!modal) return;
         modal.addEventListener('click', (e) => {
             if (e.target === modal) {
                 modal.classList.remove('active');
