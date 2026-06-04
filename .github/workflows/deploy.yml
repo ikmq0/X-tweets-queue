@@ -16,15 +16,16 @@ jobs:
           username: ${{ secrets.VPS_USERNAME }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            cd /root/x-scheduled-posting
+            cd /root/X-tweets-queue
             git pull origin main
-            docker build -t x-bot-image .
-            docker stop x-bot-container || true
-            docker rm x-bot-container || true
+            docker build -t x-tweets-image .
+            docker stop x-tweets-container || true
+            docker rm x-tweets-container || true
+            docker network create proxy-network || true
             docker run -d \
-              --name x-bot-container \
-              -p 8000:8000 \
+              --name x-tweets-container \
+              --network proxy-network \
               -v $(pwd)/data:/app/data \
               --env-file .env \
               --restart unless-stopped \
-              x-bot-image
+              x-tweets-image
