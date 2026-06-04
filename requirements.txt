@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+playwright
+pydantic
+python-dotenv
+jinja2
+python-multipart
+apscheduler
+passlib[bcrypt]
