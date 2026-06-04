@@ -37,6 +37,21 @@ A robust, self-hosted web application for scheduling and automatically posting t
    ```
    The application will be available at `http://127.0.0.1:8000`.
 
+## Docker Deployment
+
+Alternatively, you can run the entire application using Docker.
+
+1. **Build the Docker Image**:
+   ```bash
+   docker build -t x-tweets-queue .
+   ```
+
+2. **Run the Docker Container**:
+   Make sure your `.env` file is created first.
+   ```bash
+   docker run -d -p 8000:8000 --env-file .env -v ${PWD}/data:/app/data --name x-tweets-queue x-tweets-queue
+   ```
+   *Note: We mount the `data` directory as a volume so your queue and settings persist even if the container restarts.*
 ## How to get your X_AUTH_TOKEN
 1. Log into X (Twitter) in your browser.
 2. Open Developer Tools (F12) -> Application tab -> Cookies -> `https://x.com`.
