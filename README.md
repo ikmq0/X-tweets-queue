@@ -62,7 +62,7 @@ Alternatively, you can run the entire application using Docker.
    ```bash
    docker run -d -p 8000:8000 --env-file .env -v ${PWD}/data:/app/data --name x-tweets-queue x-tweets-queue
    ```
-   *Note: We mount the `data` directory as a volume so your queue and settings persist even if the container restarts.*
+   *Note: I mount the `data` directory as a volume so your queue and settings persist even if the container restarts.*
 
 ## How to get your X_AUTH_TOKEN
 1. Log into X (Twitter) in your browser.
