@@ -116,6 +116,58 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // ==================== Threading UI ====================
+    const addThreadBtn = document.getElementById('add-thread-btn');
+    const threadContainer = document.getElementById('thread-container');
+    const replyToUrl = document.getElementById('reply-to-url');
+    const replyingToContainer = document.getElementById('replying-to-container');
+    const replyingToLink = document.getElementById('replying-to-link');
+    const cancelReplyBtn = document.getElementById('cancel-reply-btn');
+
+    if (cancelReplyBtn) {
+        cancelReplyBtn.addEventListener('click', () => {
+            replyingToContainer.style.display = 'none';
+            replyToUrl.value = '';
+        });
+    }
+
+    const createThreadTextarea = (container) => {
+        const wrapper = document.createElement('div');
+        wrapper.style.display = 'flex';
+        wrapper.style.gap = '0.5rem';
+        wrapper.style.alignItems = 'flex-start';
+
+        const textarea = document.createElement('textarea');
+        textarea.dir = 'auto';
+        textarea.rows = 3;
+        textarea.placeholder = "Add another post";
+        textarea.style.flexGrow = '1';
+        textarea.className = 'thread-textarea';
+        textarea.style.padding = '0.5rem';
+        textarea.style.borderRadius = '8px';
+        textarea.style.border = '1px solid var(--border-color)';
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'btn-icon btn-delete';
+        removeBtn.textContent = '✕';
+        removeBtn.onclick = () => container.removeChild(wrapper);
+
+        wrapper.appendChild(textarea);
+        wrapper.appendChild(removeBtn);
+        container.appendChild(wrapper);
+    };
+
+    if (addThreadBtn) {
+        addThreadBtn.addEventListener('click', () => createThreadTextarea(threadContainer));
+    }
+
+    const editAddThreadBtn = document.getElementById('edit-add-thread-btn');
+    const editThreadContainer = document.getElementById('edit-thread-container');
+    if (editAddThreadBtn) {
+        editAddThreadBtn.addEventListener('click', () => createThreadTextarea(editThreadContainer));
+    }
+
     // ==================== Bot Status ====================
 
     const loadBotStatus = async () => {
@@ -288,6 +340,26 @@ document.addEventListener('DOMContentLoaded', () => {
         content.className = 'tweet-content';
         content.textContent = item.content;
 
+        if (item.thread_contents && item.thread_contents.length > 0) {
+            item.thread_contents.forEach((tc) => {
+                const tcDiv = document.createElement('div');
+                tcDiv.style.marginTop = '0.5rem';
+                tcDiv.style.paddingLeft = '1rem';
+                tcDiv.style.borderLeft = '2px solid var(--border-color)';
+                tcDiv.style.color = 'var(--text-secondary)';
+                tcDiv.textContent = tc;
+                content.appendChild(tcDiv);
+            });
+        }
+        if (item.reply_to_url) {
+            const replyBadge = document.createElement('div');
+            replyBadge.style.fontSize = '0.75rem';
+            replyBadge.style.color = 'var(--color-primary)';
+            replyBadge.style.marginBottom = '0.25rem';
+            replyBadge.innerHTML = `↳ Replying to thread`;
+            content.prepend(replyBadge);
+        }
+
         const meta = document.createElement('div');
         meta.className = 'tweet-meta';
 
@@ -309,6 +381,16 @@ document.addEventListener('DOMContentLoaded', () => {
         actions.className = 'tweet-actions';
 
         if (type === 'queued') {
+            const upBtn = document.createElement('button');
+            upBtn.className = 'btn-icon';
+            upBtn.textContent = '↑';
+            upBtn.onclick = () => swapQueueItem(item.id, 'up');
+
+            const downBtn = document.createElement('button');
+            downBtn.className = 'btn-icon';
+            downBtn.textContent = '↓';
+            downBtn.onclick = () => swapQueueItem(item.id, 'down');
+
             const editBtn = document.createElement('button');
             editBtn.className = 'btn-icon';
             editBtn.textContent = 'Edit';
@@ -319,8 +401,24 @@ document.addEventListener('DOMContentLoaded', () => {
             deleteBtn.textContent = 'Remove';
             deleteBtn.onclick = () => deleteTweet(item.id);
 
+            actions.appendChild(upBtn);
+            actions.appendChild(downBtn);
             actions.appendChild(editBtn);
             actions.appendChild(deleteBtn);
+        } else if (type === 'posted') {
+            if (item.tweet_url) {
+                const replyBtn = document.createElement('button');
+                replyBtn.className = 'btn-icon';
+                replyBtn.textContent = 'Reply';
+                replyBtn.onclick = () => {
+                    if (replyToUrl) replyToUrl.value = item.tweet_url;
+                    if (replyingToLink) replyingToLink.href = item.tweet_url;
+                    if (replyingToContainer) replyingToContainer.style.display = 'block';
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                    if (tweetContent) tweetContent.focus();
+                };
+                actions.appendChild(replyBtn);
+            }
         } else if (type === 'failed') {
             const retryBtn = document.createElement('button');
             retryBtn.className = 'btn-icon btn-retry';
@@ -352,6 +450,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
         li.appendChild(meta);
         return li;
+    };
+
+    // --- Swap Queue Items ---
+    const swapQueueItem = async (id, direction) => {
+        const queued = lastQueueData.queued || [];
+        const index = queued.findIndex(q => q.id === id);
+        if (index === -1) return;
+        
+        let targetIndex = direction === 'up' ? index - 1 : index + 1;
+        if (targetIndex < 0 || targetIndex >= queued.length) return;
+        
+        const id2 = queued[targetIndex].id;
+        try {
+            const response = await apiFetch('/api/queue/swap', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id1: id, id2: id2 })
+            });
+            if (response && response.ok) {
+                loadQueue();
+            } else {
+                showToast('Failed to reorder queue.', 'error');
+            }
+        } catch (e) {
+            showToast('Network error.', 'error');
+        }
     };
 
     // --- Delete ---
@@ -418,10 +542,13 @@ document.addEventListener('DOMContentLoaded', () => {
         else submitBtn.textContent = 'Adding...';
 
         try {
+            const threadContents = Array.from(threadContainer.querySelectorAll('.thread-textarea')).map(ta => ta.value.trim()).filter(v => v);
+            const rUrl = replyToUrl && replyToUrl.value ? replyToUrl.value : null;
+
             const response = await apiFetch('/api/queue', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content, post_now: postNow })
+                body: JSON.stringify({ content, post_now: postNow, thread_contents: threadContents, reply_to_url: rUrl })
             });
 
             if (response && response.ok) {
@@ -433,6 +560,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     showToast(`Queued for ${scheduledDate.toLocaleDateString()} ${scheduledDate.toLocaleTimeString()}`, 'success');
                 }
                 tweetContent.value = '';
+                if (threadContainer) threadContainer.innerHTML = '';
+                if (replyToUrl) replyToUrl.value = '';
+                if (replyingToContainer) replyingToContainer.style.display = 'none';
+                
                 charCount.textContent = '0 / 280';
                 charCount.classList.remove('over-limit');
                 loadQueue();
@@ -482,6 +613,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const openEditModal = (item) => {
         editId.value = item.id;
         editContent.value = item.content;
+        if (editThreadContainer) editThreadContainer.innerHTML = '';
+        if (item.thread_contents) {
+            item.thread_contents.forEach(tc => {
+                createThreadTextarea(editThreadContainer);
+                const textareas = editThreadContainer.querySelectorAll('.thread-textarea');
+                textareas[textareas.length - 1].value = tc;
+            });
+        }
         editModal.classList.add('active');
         editContent.focus();
     };
@@ -500,11 +639,13 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        const threadContents = Array.from(editThreadContainer.querySelectorAll('.thread-textarea')).map(ta => ta.value.trim()).filter(v => v);
+
         try {
             const response = await apiFetch(`/api/queue/${id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content })
+                body: JSON.stringify({ content, thread_contents: threadContents })
             });
 
             if (response && response.ok) {

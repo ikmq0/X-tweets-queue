@@ -66,9 +66,12 @@ _settings_lock = asyncio.Lock()
 class TweetRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=280)
     post_now: bool = False
+    thread_contents: List[str] = Field(default_factory=list)
+    reply_to_url: str | None = None
 
 class EditTweetRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=280)
+    thread_contents: List[str] = Field(default_factory=list)
 
 class SettingsRequest(BaseModel):
     windows: List[List[int]]
@@ -194,7 +197,7 @@ def get_next_available_slot(queue_data):
 
 # --- Playwright Automation ---
 
-async def post_tweet(content: str):
+async def post_tweet(content: str, thread_contents: List[str] = None, reply_to_url: str = None):
     token = _get_x_auth_token()
     if not token:
         return "SYSTEM_ERROR", "X_AUTH_TOKEN is missing in .env file."
@@ -209,8 +212,7 @@ async def post_tweet(content: str):
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--single-process"
+                    "--disable-gpu"
                 ]
             )
             context = await browser.new_context()
@@ -225,7 +227,15 @@ async def post_tweet(content: str):
             }])
 
             page = await context.new_page()
-            await page.goto("https://x.com/compose/post")
+            
+            if reply_to_url:
+                if "/status/" in reply_to_url:
+                    tweet_id = reply_to_url.split("/status/")[1].split("?")[0]
+                    await page.goto(f"https://x.com/intent/tweet?in_reply_to={tweet_id}")
+                else:
+                    await page.goto(reply_to_url)
+            else:
+                await page.goto("https://x.com/compose/post")
 
             # Check if redirected to login or locked page
             await page.wait_for_load_state("domcontentloaded")
@@ -242,6 +252,14 @@ async def post_tweet(content: str):
                 return "SYSTEM_ERROR", "Browser timeout: X.com took too long to respond or the website layout changed."
 
             await page.fill('[data-testid="tweetTextarea_0"]', content)
+            
+            if thread_contents:
+                for i, thread_content in enumerate(thread_contents):
+                    await page.click('[aria-label="Add post"]')
+                    new_textarea = f'[data-testid="tweetTextarea_{i+1}"]'
+                    await page.wait_for_selector(new_textarea, timeout=5000)
+                    await page.fill(new_textarea, thread_content)
+
             await page.click('[data-testid="tweetButton"]')
 
             # Verify the tweet was posted by waiting for any toast notification
@@ -252,7 +270,14 @@ async def post_tweet(content: str):
                 
                 if "sent" in toast_text_lower:
                     print("Tweet posted successfully — success toast appeared.")
-                    return "SUCCESS", "Posted successfully."
+                    posted_url = None
+                    try:
+                        view_link = await toast.query_selector('a[href*="/status/"]')
+                        if view_link:
+                            posted_url = "https://x.com" + await view_link.get_attribute("href")
+                    except Exception:
+                        pass
+                    return "SUCCESS", posted_url or "Posted successfully."
                 elif "already sent" in toast_text_lower:
                     return "TWEET_ERROR", "Duplicate tweet detected by X.com."
                 elif "limit" in toast_text_lower:
@@ -285,13 +310,19 @@ async def process_queue_tick():
         for item_to_post in ready_items:
             print(f"Time to post! Attempting item: {item_to_post['id']} (attempt {item_to_post.get('retry_count', 0) + 1})")
             
-            status, message = await post_tweet(item_to_post["content"])
+            status, message = await post_tweet(
+                item_to_post["content"], 
+                item_to_post.get("thread_contents"), 
+                item_to_post.get("reply_to_url")
+            )
 
             if status == "SUCCESS":
                 def move_to_posted(data):
                     data["queued"] = [x for x in data["queued"] if x["id"] != item_to_post["id"]]
                     item_to_post["posted_at"] = datetime.now(RIYADH_TZ).isoformat()
                     item_to_post["last_error"] = None
+                    if message and "https://x.com" in message:
+                        item_to_post["tweet_url"] = message
                     if "posted" not in data:
                         data["posted"] = []
                     data["posted"].append(item_to_post)
@@ -431,6 +462,30 @@ async def get_queue(user: str = Depends(require_auth)):
     queue_data["queued"] = sorted(queue_data.get("queued", []), key=lambda x: x["scheduled_at"])
     return queue_data
 
+class SwapRequest(BaseModel):
+    id1: str
+    id2: str
+
+@app.post("/api/queue/swap")
+async def swap_queue_items(req: SwapRequest, user: str = Depends(require_auth)):
+    def do_swap(data):
+        queued = data.get("queued", [])
+        idx1 = next((i for i, x in enumerate(queued) if x["id"] == req.id1), None)
+        idx2 = next((i for i, x in enumerate(queued) if x["id"] == req.id2), None)
+        if idx1 is not None and idx2 is not None:
+            t1 = queued[idx1]["scheduled_at"]
+            t2 = queued[idx2]["scheduled_at"]
+            queued[idx1]["scheduled_at"] = t2
+            queued[idx2]["scheduled_at"] = t1
+            data["queued"] = sorted(queued, key=lambda x: x["scheduled_at"])
+            return True
+        return False
+
+    success = await load_and_save_json(QUEUE_FILE, {"queued": [], "posted": [], "failed": []}, _queue_lock, do_swap)
+    if not success:
+        raise HTTPException(status_code=404, detail="Items not found in queue")
+    return {"message": "Queue reordered"}
+
 @app.post("/api/queue")
 async def add_tweet(tweet: TweetRequest, user: str = Depends(require_auth)):
     result = {}
@@ -448,6 +503,8 @@ async def add_tweet(tweet: TweetRequest, user: str = Depends(require_auth)):
         new_item = {
             "id": str(uuid.uuid4()),
             "content": tweet.content.strip(),
+            "thread_contents": [c.strip() for c in tweet.thread_contents if c.strip()],
+            "reply_to_url": tweet.reply_to_url,
             "created_at": datetime.now(RIYADH_TZ).isoformat(),
             "scheduled_at": scheduled_dt.isoformat(),
             "retry_count": 0
@@ -467,6 +524,7 @@ async def edit_tweet(item_id: str, tweet: EditTweetRequest, user: str = Depends(
         for item in data["queued"]:
             if item["id"] == item_id:
                 item["content"] = tweet.content.strip()
+                item["thread_contents"] = [c.strip() for c in tweet.thread_contents if c.strip()]
                 found["item"] = item
                 return
 
