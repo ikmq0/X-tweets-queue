@@ -137,15 +137,40 @@ document.addEventListener('DOMContentLoaded', () => {
         wrapper.style.gap = '0.5rem';
         wrapper.style.alignItems = 'flex-start';
 
+        const textareaContainer = document.createElement('div');
+        textareaContainer.style.flexGrow = '1';
+        textareaContainer.style.display = 'flex';
+        textareaContainer.style.flexDirection = 'column';
+        textareaContainer.style.gap = '0.25rem';
+        textareaContainer.style.width = '100%';
+
         const textarea = document.createElement('textarea');
         textarea.dir = 'auto';
         textarea.rows = 3;
         textarea.placeholder = "Add another post";
-        textarea.style.flexGrow = '1';
         textarea.className = 'thread-textarea';
         textarea.style.padding = '0.5rem';
         textarea.style.borderRadius = '8px';
         textarea.style.border = '1px solid var(--border-color)';
+        textarea.style.width = '100%';
+        textarea.style.boxSizing = 'border-box';
+        textarea.style.resize = 'vertical';
+
+        const charCount = document.createElement('div');
+        charCount.style.fontSize = '0.8rem';
+        charCount.style.color = 'var(--text-secondary)';
+        charCount.style.textAlign = 'right';
+        charCount.textContent = '0 / 280';
+
+        textarea.addEventListener('input', () => {
+            const count = textarea.value.length;
+            charCount.textContent = `${count} / 280`;
+            if (count > 280) {
+                charCount.classList.add('over-limit');
+            } else {
+                charCount.classList.remove('over-limit');
+            }
+        });
 
         const removeBtn = document.createElement('button');
         removeBtn.type = 'button';
@@ -153,7 +178,10 @@ document.addEventListener('DOMContentLoaded', () => {
         removeBtn.textContent = '✕';
         removeBtn.onclick = () => container.removeChild(wrapper);
 
-        wrapper.appendChild(textarea);
+        textareaContainer.appendChild(textarea);
+        textareaContainer.appendChild(charCount);
+
+        wrapper.appendChild(textareaContainer);
         wrapper.appendChild(removeBtn);
         container.appendChild(wrapper);
     };
@@ -534,6 +562,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Add to Queue or Post Now ---
     const submitTweet = async (content, postNow) => {
+        const threadContents = Array.from(threadContainer.querySelectorAll('.thread-textarea')).map(ta => ta.value.trim()).filter(v => v);
+        
+        if (threadContents.some(tc => tc.length > 280)) {
+            showToast('Thread tweets must be 280 characters or fewer.', 'warning');
+            return;
+        }
+
         submitBtn.disabled = true;
         if (postNowBtn) postNowBtn.disabled = true;
         
@@ -542,7 +577,6 @@ document.addEventListener('DOMContentLoaded', () => {
         else submitBtn.textContent = 'Adding...';
 
         try {
-            const threadContents = Array.from(threadContainer.querySelectorAll('.thread-textarea')).map(ta => ta.value.trim()).filter(v => v);
             const rUrl = replyToUrl && replyToUrl.value ? replyToUrl.value : null;
 
             const response = await apiFetch('/api/queue', {
@@ -618,7 +652,9 @@ document.addEventListener('DOMContentLoaded', () => {
             item.thread_contents.forEach(tc => {
                 createThreadTextarea(editThreadContainer);
                 const textareas = editThreadContainer.querySelectorAll('.thread-textarea');
-                textareas[textareas.length - 1].value = tc;
+                const latestTa = textareas[textareas.length - 1];
+                latestTa.value = tc;
+                latestTa.dispatchEvent(new Event('input'));
             });
         }
         editModal.classList.add('active');
@@ -640,6 +676,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         const threadContents = Array.from(editThreadContainer.querySelectorAll('.thread-textarea')).map(ta => ta.value.trim()).filter(v => v);
+
+        if (threadContents.some(tc => tc.length > 280)) {
+            showToast('Thread tweets must be 280 characters or fewer.', 'warning');
+            return;
+        }
 
         try {
             const response = await apiFetch(`/api/queue/${id}`, {
